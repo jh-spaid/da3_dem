@@ -7,6 +7,7 @@ from qgis.core import (
 from PyQt5.QtCore import QSize
 import processing
 import os
+import math
 
 # =========================
 # 0) 사용자 설정
@@ -28,6 +29,11 @@ VW_DPI = 96
 
 # 최대 타일 개수
 MAX_TILES = 500  # 테스트용
+
+# [방법 A] 공간적으로 고르게 뽑기 설정
+# 정렬 기준: 위도(남->북) + 경도(서->동)로 정렬 후 균등 간격 샘플링
+# 필요하면 south_to_north=False로 바꾸면 북->남으로 정렬
+south_to_north = True
 
 # =========================
 # 1) 레이어 가져오기
@@ -57,7 +63,10 @@ for layer in proj.mapLayers().values():
     if hasattr(layer, 'extent'):  # 래스터 레이어 확인
         ext = layer.extent()
         print(f"   - {layer.name()}")
-        print(f"     CRS: {layer.crs().authid()}")
+        try:
+            print(f"     CRS: {layer.crs().authid()}")
+        except Exception:
+            pass
         print(f"     범위: ({ext.xMinimum():.2f}, {ext.yMinimum():.2f}) - ({ext.xMaximum():.2f}, {ext.yMaximum():.2f})")
 
 print("\n" + "="*60)
@@ -92,7 +101,7 @@ if dsm:
     dsm_crs = dsm.crs()
     print(f"   DSM: {dsm_crs.authid()}")
     print(f"        범위: ({dsm_ext.xMinimum():.6f}, {dsm_ext.yMinimum():.6f}) - ({dsm_ext.xMaximum():.6f}, {dsm_ext.yMaximum():.6f})")
-    
+
 if dem:
     dem_ext = dem.extent()
     dem_crs = dem.crs()
@@ -104,10 +113,8 @@ if dem:
 # =========================
 def warp_clip_to_target(in_raster, extent_target, out_path, resampling=1, nodata=None):
     """래스터를 범위로 자르고 목표 좌표계로 변환"""
-    
-    # 범위를 문자열로 변환
     extent_str = f"{extent_target.xMinimum()},{extent_target.xMaximum()},{extent_target.yMinimum()},{extent_target.yMaximum()}"
-    
+
     params = {
         "INPUT": in_raster,
         "SOURCE_CRS": None,
@@ -123,7 +130,7 @@ def warp_clip_to_target(in_raster, extent_target, out_path, resampling=1, nodata
         "EXTRA": "",
         "OUTPUT": out_path
     }
-    
+
     try:
         result = processing.run("gdal:warpreproject", params)
         if result and result["OUTPUT"] and os.path.exists(result["OUTPUT"]):
@@ -173,7 +180,7 @@ def render_vworld_tile_tif(vw_layer, extent_target: QgsRectangle, out_tif, width
     img = job.renderedImage()
 
     os.makedirs(os.path.dirname(out_tif), exist_ok=True)
-    
+
     # 임시 TIF로 저장
     temp_tif = out_tif.replace(".tif", "_temp.tif")
     ok = img.save(temp_tif, "TIFF")
@@ -182,7 +189,7 @@ def render_vworld_tile_tif(vw_layer, extent_target: QgsRectangle, out_tif, width
 
     # GDAL로 GeoTIFF 변환 (좌표계 내장)
     extent_str = f"{extent_target.xMinimum()},{extent_target.xMaximum()},{extent_target.yMinimum()},{extent_target.yMaximum()}"
-    
+
     params = {
         "INPUT": temp_tif,
         "TARGET_CRS": target_crs,
@@ -195,7 +202,7 @@ def render_vworld_tile_tif(vw_layer, extent_target: QgsRectangle, out_tif, width
         "DATA_TYPE": 0,
         "OUTPUT": out_tif
     }
-    
+
     try:
         processing.run("gdal:translate", params)
         # 임시 파일 삭제
@@ -206,7 +213,7 @@ def render_vworld_tile_tif(vw_layer, extent_target: QgsRectangle, out_tif, width
         if os.path.exists(temp_tif):
             os.rename(temp_tif, out_tif)
         print(f"      ⚠ GeoTIFF 변환 실패, 일반 TIF로 저장: {e}")
-    
+
     # TFW (World file) 생성
     px_x = extent_target.width() / width_px
     px_y = extent_target.height() / height_px
@@ -220,61 +227,88 @@ def render_vworld_tile_tif(vw_layer, extent_target: QgsRectangle, out_tif, width
     prj_path = os.path.splitext(out_tif)[0] + ".prj"
     with open(prj_path, "w", encoding="utf-8") as f:
         f.write(target_wkt)
-    
+
     file_size = os.path.getsize(out_tif) / 1024
     print(f"      ✓ {os.path.basename(out_tif)} ({file_size:.1f} KB, {width_px}x{height_px})")
 
 # =========================
 # 4) 타일별 처리
 # =========================
-# 선택 타일이 있으면 선택만, 없으면 전체
+# 선택 타일이 있으면 선택만, 없으면 자동 선택
 features = list(grid.selectedFeatures())
 if features:
     print(f"\n📌 선택된 {len(features)}개 타일 처리")
 else:
     print(f"\n🔍 DSM/DEM 범위 내의 타일 자동 선택 중...")
-    
-    # DSM/DEM 범위 확인
+
+    # DSM/DEM 범위 확인 (우선 DSM, 없으면 DEM)
     dsm_extent_4326 = None
     if dsm:
         dsm_extent_4326 = dsm.extent()
     elif dem:
         dsm_extent_4326 = dem.extent()
-    
+
     if dsm_extent_4326:
-        # 5179 → 4326 변환기
+        # 5179 → 4326 변환기 (필터링/정렬에 사용)
         ct_5179_to_4326 = QgsCoordinateTransform(
             grid.crs(),
             QgsCoordinateReferenceSystem("EPSG:4326"),
             QgsProject.instance()
         )
-        
-        # 범위 내 타일 필터링
-        filtered_features = []
+
+        # 1) 범위 내 타일을 "전부" 모은다 (여기서 MAX_TILES로 break하지 않음)
+        all_inside = []
         for feat in grid.getFeatures():
             geom = QgsGeometry(feat.geometry())
             geom.transform(ct_5179_to_4326)
             tile_extent = geom.boundingBox()
-            
-            # DSM 범위 내에 완전히 포함되는지 확인 (경계선 제외)
+
             if (tile_extent.xMinimum() >= dsm_extent_4326.xMinimum() and
                 tile_extent.xMaximum() <= dsm_extent_4326.xMaximum() and
                 tile_extent.yMinimum() >= dsm_extent_4326.yMinimum() and
                 tile_extent.yMaximum() <= dsm_extent_4326.yMaximum()):
-                filtered_features.append(feat)
-                if len(filtered_features) >= MAX_TILES:
-                    break
-        
-        features = filtered_features
-        print(f"✅ DSM/DEM 범위와 겹치는 {len(features)}개 타일 발견")
+                # centroid로 공간 정렬용 키 만들기
+                try:
+                    c = geom.centroid().asPoint()
+                    # (lat, lon)로 저장
+                    all_inside.append((feat, float(c.y()), float(c.x())))
+                except Exception:
+                    # centroid 실패시 bbox center 대체
+                    bb = geom.boundingBox()
+                    all_inside.append((feat, float((bb.yMinimum()+bb.yMaximum())/2.0), float((bb.xMinimum()+bb.xMaximum())/2.0)))
+
+        if len(all_inside) == 0:
+            print("❌ 처리할 타일이 없습니다.")
+            print("   DSM/DEM 범위와 그리드 타일이 겹치지 않습니다.")
+            raise SystemExit(0)
+
+        print(f"✅ DSM/DEM 범위 내 후보 타일: {len(all_inside)}개")
+
+        # 2) 남->북(위도 오름차순) + 서->동(경도 오름차순) 정렬 (원하면 north->south도 가능)
+        if south_to_north:
+            all_inside.sort(key=lambda t: (t[1], t[2]))  # lat asc, lon asc
+        else:
+            all_inside.sort(key=lambda t: (-t[1], t[2]))  # lat desc, lon asc
+
+        # 3) 균등 간격 샘플링으로 MAX_TILES개 고르게 선택
+        if len(all_inside) > MAX_TILES:
+            step = len(all_inside) / float(MAX_TILES)
+            picked = []
+            for i in range(MAX_TILES):
+                idx = int(math.floor(i * step))
+                if idx >= len(all_inside):
+                    idx = len(all_inside) - 1
+                picked.append(all_inside[idx])
+            features = [t[0] for t in picked]
+            print(f"🎯 공간적으로 고르게 {len(features)}개 타일 선택 (간격 샘플링)")
+        else:
+            features = [t[0] for t in all_inside]
+            print(f"🎯 후보가 {MAX_TILES}개 이하라 전부 선택: {len(features)}개")
+
     else:
+        # DSM/DEM이 없을 때는 원래대로 처음 N개
         features = list(grid.getFeatures())[:MAX_TILES]
         print(f"⚠️ DSM/DEM 없음. 처음 {len(features)}개 타일 처리")
-    
-    if len(features) == 0:
-        print("❌ 처리할 타일이 없습니다.")
-        print("   DSM/DEM 범위와 그리드 타일이 겹치지 않습니다.")
-        raise SystemExit(0)
 
 field_names = [f.name() for f in grid.fields()]
 if TILE_ID_FIELD not in field_names:
@@ -297,18 +331,17 @@ for i, feat in enumerate(features, 1):
     geom_target = QgsGeometry(feat.geometry())
     geom_target.transform(ct)
     rect_target = geom_target.boundingBox()
-    
+
     print(f"   범위: ({rect_target.xMinimum():.6f}, {rect_target.yMinimum():.6f}) - ({rect_target.xMaximum():.6f}, {rect_target.yMaximum():.6f})")
 
-    # DSM 처리 (범위 사용) - 완전히 포함되는지 체크
+    # DSM 처리
     if dsm:
         dsm_extent = dsm.extent()
-        # 타일이 DSM 범위 내에 완전히 포함되는지 확인
         is_inside = (rect_target.xMinimum() >= dsm_extent.xMinimum() and
                      rect_target.xMaximum() <= dsm_extent.xMaximum() and
                      rect_target.yMinimum() >= dsm_extent.yMinimum() and
                      rect_target.yMaximum() <= dsm_extent.yMaximum())
-        
+
         if is_inside:
             out_dsm = os.path.join(dsm_dir, f"{tile_id_safe}.tif")
             if warp_clip_to_target(dsm, rect_target, out_dsm, resampling=1, nodata=-9999):
@@ -316,15 +349,14 @@ for i, feat in enumerate(features, 1):
         else:
             print(f"      ⊘ DSM: 타일이 데이터 범위 밖")
 
-    # DEM 처리 (범위 사용) - 완전히 포함되는지 체크
+    # DEM 처리
     if dem:
         dem_extent = dem.extent()
-        # 타일이 DEM 범위 내에 완전히 포함되는지 확인
         is_inside = (rect_target.xMinimum() >= dem_extent.xMinimum() and
                      rect_target.xMaximum() <= dem_extent.xMaximum() and
                      rect_target.yMinimum() >= dem_extent.yMinimum() and
                      rect_target.yMaximum() <= dem_extent.yMaximum())
-        
+
         if is_inside:
             out_dem = os.path.join(dem_dir, f"{tile_id_safe}.tif")
             if warp_clip_to_target(dem, rect_target, out_dem, resampling=1, nodata=-9999):
