@@ -15,6 +15,16 @@ QGIS 출력 데이터셋 구조 (EPSG:4326):
     val/*.npz
     visualizations/train/*.png
     visualizations/val/*.png
+
+[방법 1 + 보완]
+1) "공간 블록" 단위로 균형 샘플링:
+   - block_key = f"{tile_id}_sx{x0}_sy{y0}"  (tile_read 윈도우 단위)
+   - 블록당 최대 패치 수(--max_patches_per_block)로 캡(oversampling 방지)
+2) Train/Val split도 block 단위로 수행 (--split_by 기본)
+   - 같은 블록의 패치가 train/val에 섞이는 누수 최소화
+3) split_by=block_tile 옵션 추가
+   - 타일 내부에서 block 단위로 split
+   - 중복 없음 + 분포 유사성을 동시에 만족
 """
 
 import argparse
@@ -22,7 +32,7 @@ import json
 import random
 import re
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 import rasterio
@@ -121,6 +131,7 @@ RGB shape:   {rgb.shape}
 DSM shape:   {dsm.shape}
 GSD tgt:     {meta.get("tgt_gsd", "N/A")} m/px
 TileID:      {meta.get("tile_id", "N/A")}
+Block:       {meta.get("block_key", "N/A")}
 """
             axes[1, 1].text(
                 0.05, 0.5, stats_text,
@@ -159,9 +170,7 @@ def extract_tile_key(name: str) -> Optional[str]:
       35716082.tfw -> "35716082"
     """
     name_lower = name.lower()
-    # .tif, .tiff, .tfw 등 확장자 제거
     name_base = name_lower.replace('.tif', '').replace('.tiff', '').replace('.tfw', '').replace('.prj', '')
-    # 숫자만 추출
     m = re.match(r'^(\d{6,})$', name_base)
     if m:
         return m.group(1)
@@ -169,32 +178,25 @@ def extract_tile_key(name: str) -> Optional[str]:
 
 
 def find_image_files(dataset_root: Path) -> List[Path]:
-    """RGB 파일 찾기"""
     img_dir = dataset_root / "RGB"
-    
     if not img_dir.exists():
         raise RuntimeError(f"RGB directory not found: {img_dir}")
-
     candidates = sorted(img_dir.glob("*.tif")) + sorted(img_dir.glob("*.tiff"))
     return candidates
 
 
 def find_dsm_files(dataset_root: Path) -> List[Path]:
-    """DSM 파일 찾기"""
     dsm_dir = dataset_root / "DSM"
     if not dsm_dir.exists():
         raise RuntimeError(f"DSM directory not found: {dsm_dir}")
-
     tifs = sorted(dsm_dir.glob("*.tif")) + sorted(dsm_dir.glob("*.tiff"))
     return tifs
 
 
 def find_dem_files(dataset_root: Path) -> List[Path]:
-    """DEM 파일 찾기"""
     dem_dir = dataset_root / "DEM"
     if not dem_dir.exists():
         return []
-    
     tifs = sorted(dem_dir.glob("*.tif")) + sorted(dem_dir.glob("*.tiff"))
     return tifs
 
@@ -241,11 +243,8 @@ def read_resampled_window(
 
 
 def dataset_gsd(ds: rasterio.io.DatasetReader) -> float:
-    """GSD (Ground Sample Distance) 계산"""
     t = ds.transform
-    # EPSG:4326의 경우 도 단위이므로 미터로 변환
     if ds.crs and ds.crs.to_epsg() == 4326:
-        # 위도 1도 ≈ 111km
         return float(abs(t.a)) * 111000
     else:
         return float(abs(t.a))
@@ -255,11 +254,94 @@ def compute_scale(src_gsd: float, tgt_gsd: float) -> float:
     return float(src_gsd) / float(tgt_gsd)
 
 
+def group_split(
+    items: List[Tuple[Path, str, str]],
+    train_ratio: float,
+    seed: int,
+    split_by: str = "block",
+) -> Tuple[List[Path], List[Path]]:
+    """
+    items: [(npz_path, tile_id, block_key), ...]  (현재는 tmp_dir 아래)
+    split_by:
+      - "patch": 완전 랜덤
+      - "block": block_key 단위로 묶어서 split
+      - "tile":  tile_id 단위로 묶어서 split
+      - "block_tile": 타일 내부에서 block 단위 split (중복 없음 + 분포 유사)
+    """
+    rng = random.Random(seed)
+
+    if split_by == "patch":
+        paths = [p for p, _, _ in items]
+        rng.shuffle(paths)
+        n_train = int(len(paths) * train_ratio)
+        return paths[:n_train], paths[n_train:]
+
+    if split_by in ("block", "tile"):
+        groups: Dict[str, List[Path]] = {}
+        for p, tile_id, block_key in items:
+            key = block_key if split_by == "block" else tile_id
+            groups.setdefault(key, []).append(p)
+
+        keys = list(groups.keys())
+        rng.shuffle(keys)
+        n_train_keys = int(len(keys) * train_ratio)
+
+        train_keys = set(keys[:n_train_keys])
+        train_paths: List[Path] = []
+        val_paths: List[Path] = []
+
+        for k, plist in groups.items():
+            if k in train_keys:
+                train_paths.extend(plist)
+            else:
+                val_paths.extend(plist)
+
+        rng.shuffle(train_paths)
+        rng.shuffle(val_paths)
+        return train_paths, val_paths
+
+    if split_by == "block_tile":
+        # tile -> block -> [paths]
+        tiles: Dict[str, Dict[str, List[Path]]] = {}
+        for p, tile_id, block_key in items:
+            tiles.setdefault(tile_id, {}).setdefault(block_key, []).append(p)
+
+        train_paths: List[Path] = []
+        val_paths: List[Path] = []
+
+        for tile_id, blocks in tiles.items():
+            block_keys = list(blocks.keys())
+            rng.shuffle(block_keys)
+
+            if len(block_keys) == 1:
+                if rng.random() < train_ratio:
+                    train_keys = set(block_keys)
+                else:
+                    train_keys = set()
+            else:
+                n_train = int(round(len(block_keys) * train_ratio))
+                n_train = min(max(1, n_train), len(block_keys) - 1)
+                train_keys = set(block_keys[:n_train])
+
+            for bk, plist in blocks.items():
+                if bk in train_keys:
+                    train_paths.extend(plist)
+                else:
+                    val_paths.extend(plist)
+
+        rng.shuffle(train_paths)
+        rng.shuffle(val_paths)
+        return train_paths, val_paths
+
+    raise ValueError(f"Unknown split_by: {split_by}")
+
+
 # -----------------------------
 # Main
 # -----------------------------
 def main():
     ap = argparse.ArgumentParser(description="한국 데이터셋 생성 (EPSG:4326)")
+
     ap.add_argument("--dataset_root", type=str, required=True,
                     help="데이터셋 루트 (RGB/, DSM/, DEM/ 포함)")
     ap.add_argument("--out_dir", type=str, required=True,
@@ -273,7 +355,7 @@ def main():
     ap.add_argument("--stride_read", type=int, default=1024,
                     help="타일 읽기 스트라이드")
 
-    ap.add_argument("--patch", type=int, default=518,
+    ap.add_argument("--patch", type=int, default=512,
                     help="패치 크기")
     ap.add_argument("--stride_patch", type=int, default=64,
                     help="패치 스트라이드")
@@ -292,6 +374,13 @@ def main():
     ap.add_argument("--visualize", action="store_true", default=False)
     ap.add_argument("--n_viz_samples", type=int, default=5)
 
+    # ===== 방법 1 핵심 옵션 =====
+    ap.add_argument("--max_patches_per_block", type=int, default=20,
+                    help="(균형 샘플링) 블록(tile_read 윈도우)당 최대 저장 패치 수. 0이면 제한 없음.")
+    ap.add_argument("--split_by", type=str, default="block",
+                    choices=["patch", "block", "tile", "block_tile"],
+                    help="train/val split 단위: patch, block, tile, block_tile(타일 내부 block split)")
+
     args = ap.parse_args()
 
     root = Path(args.dataset_root)
@@ -301,18 +390,18 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    print("="*70)
-    print("한국 데이터셋 생성 (EPSG:4326)")
-    print("="*70)
+    print("=" * 70)
+    print("한국 데이터셋 생성 (EPSG:4326) [균형 샘플링: block cap + group split]")
+    print("=" * 70)
 
     images = find_image_files(root)
     dsm_files = find_dsm_files(root)
     dem_files = find_dem_files(root) if args.use_dem else []
 
     if not images:
-        raise RuntimeError(f"No RGB tiles found under {root/'RGB'}")
+        raise RuntimeError(f"No RGB tiles found under {root / 'RGB'}")
     if not dsm_files:
-        raise RuntimeError(f"No DSM tiles found under {root/'DSM'}")
+        raise RuntimeError(f"No DSM tiles found under {root / 'DSM'}")
 
     dsm_index = build_raster_index(dsm_files)
     dem_index = build_raster_index(dem_files) if dem_files else {}
@@ -330,9 +419,13 @@ def main():
     ensure_dir(val_dir)
     ensure_dir(tmp_dir)
 
-    kept_paths = []
+    # kept: [(tmp_path, tile_id, block_key), ...]
+    kept_items: List[Tuple[Path, str, str]] = []
     total_candidates = 0
     total_kept = 0
+
+    # 블록별 저장 캡
+    block_counts: Dict[str, int] = {}
 
     for img_path in images:
         tile_id = extract_tile_key(img_path.name)
@@ -351,7 +444,7 @@ def main():
 
         with rasterio.open(img_path) as img_ds, rasterio.open(dsm_path) as dsm_ds:
             dem_ds = rasterio.open(dem_path) if dem_path is not None else None
-            
+
             # CRS 확인
             if img_ds.crs is None:
                 if args.verbose:
@@ -366,20 +459,21 @@ def main():
                 dsm_crs = CRS.from_epsg(4326)
             else:
                 dsm_crs = dsm_ds.crs
-            
+
             if dem_ds is not None and dem_ds.crs is None:
                 if args.verbose:
                     print(f"[WARN] DEM has no CRS. Assume EPSG:4326: {dem_path}")
                 dem_crs = CRS.from_epsg(4326)
             elif dem_ds is not None:
                 dem_crs = dem_ds.crs
+            else:
+                dem_crs = None
 
             img_src_gsd = dataset_gsd(img_ds)
             scale = compute_scale(img_src_gsd, args.tgt_gsd)
             if scale <= 0:
                 raise RuntimeError("Invalid scale computed.")
 
-            # nodata
             dsm_nodata = args.dsm_nodata if args.dsm_nodata is not None else dsm_ds.nodata
             dem_nodata = args.dem_nodata if args.dem_nodata is not None else (dem_ds.nodata if dem_ds else None)
 
@@ -430,14 +524,13 @@ def main():
 
                     win = Window(x0, y0, win_w, win_h)
 
+                    # ===== block_key (균형 샘플링 단위) =====
+                    block_key = f"{tile_id}_sx{x0}_sy{y0}"
+
                     # RGB 읽기
                     img_bands = img_ds.count
-                    # RGBA인 경우 RGB만 사용
-                    if img_bands >= 3:
-                        use_bands = [1, 2, 3]
-                    else:
-                        use_bands = list(range(1, img_bands + 1))
-                    
+                    use_bands = [1, 2, 3] if img_bands >= 3 else list(range(1, img_bands + 1))
+
                     rgb_tile = read_resampled_window(
                         img_ds, win, out_h, out_w,
                         resampling=Resampling.bilinear,
@@ -495,6 +588,12 @@ def main():
                         for px in range(0, out_w - args.patch + 1, args.stride_patch):
                             total_candidates += 1
 
+                            # ===== 블록당 캡 체크 =====
+                            if args.max_patches_per_block and args.max_patches_per_block > 0:
+                                c = block_counts.get(block_key, 0)
+                                if c >= args.max_patches_per_block:
+                                    continue
+
                             dsm_patch = dsm_tile[py:py + args.patch, px:px + args.patch]
                             m_patch = valid[py:py + args.patch, px:px + args.patch]
                             vr = float(m_patch.mean())
@@ -508,6 +607,7 @@ def main():
                             meta = {
                                 "city": city,
                                 "tile_id": tile_id,
+                                "block_key": block_key,
                                 "img_path": str(img_path),
                                 "dsm_path": str(dsm_path),
                                 "dem_path": str(dem_path) if dem_path else None,
@@ -546,12 +646,16 @@ def main():
 
                             np.savez_compressed(out_path, **save_kwargs)
 
-                            kept_paths.append(out_path)
+                            kept_items.append((out_path, tile_id, block_key))
                             total_kept += 1
-                            
+
+                            # 캡 카운트 증가
+                            if args.max_patches_per_block and args.max_patches_per_block > 0:
+                                block_counts[block_key] = block_counts.get(block_key, 0) + 1
+
                             if args.verbose and total_kept % 100 == 0:
                                 print(f"  [{total_kept}] patches created...")
-                            
+
                             if total_kept >= args.max_patches:
                                 break
                         if total_kept >= args.max_patches:
@@ -570,25 +674,32 @@ def main():
         if total_kept >= args.max_patches:
             break
 
-    if not kept_paths:
+    if not kept_items:
         print(f"Done. kept 0/{total_candidates} patches")
         print("Saved: train=0 val=0")
         return
 
-    random.shuffle(kept_paths)
-    n_train = int(len(kept_paths) * args.train_ratio)
-    train_list = kept_paths[:n_train]
-    val_list = kept_paths[n_train:]
+    # ===== 그룹 단위 split (block 기본) =====
+    train_list, val_list = group_split(
+        kept_items,
+        train_ratio=args.train_ratio,
+        seed=args.seed,
+        split_by=args.split_by
+    )
 
+    # move to train/val
     for p in train_list:
         p.rename(train_dir / p.name)
     for p in val_list:
         p.rename(val_dir / p.name)
 
-    print(f"\nDone. kept {len(kept_paths)}/{total_candidates} patches")
+    print(f"\nDone. kept {len(kept_items)}/{total_candidates} patches")
     print(f"Saved: train={len(train_list)} val={len(val_list)}")
+    print(f"[SPLIT] split_by={args.split_by}  train_ratio={args.train_ratio}")
+    if args.max_patches_per_block and args.max_patches_per_block > 0:
+        print(f"[BALANCE] max_patches_per_block={args.max_patches_per_block}  blocks={len(block_counts)}")
 
-    if args.visualize and len(kept_paths) > 0:
+    if args.visualize and len(kept_items) > 0:
         print("\n" + "=" * 70)
         print("Creating Visualizations")
         print("=" * 70)
@@ -605,4 +716,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
