@@ -153,28 +153,6 @@ def mark_only_lora_trainable(module: nn.Module):
             m.lora_B.weight.requires_grad = True
 
 
-def lora_stats(module: nn.Module):
-    count = 0
-    a_norm = 0.0
-    b_norm = 0.0
-    for m in module.modules():
-        if isinstance(m, LoRALinear):
-            count += 1
-            a_norm += float(m.lora_A.weight.norm().detach().cpu())
-            b_norm += float(m.lora_B.weight.norm().detach().cpu())
-    return count, a_norm, b_norm
-
-
-def list_linear_module_names(module: nn.Module, max_items=120):
-    names = []
-    for name, child in module.named_modules():
-        if isinstance(child, nn.Linear):
-            names.append(name)
-            if len(names) >= max_items:
-                break
-    return names
-
-
 # ==================== Stats init ====================
 def estimate_dem_ndsm_stats(
     train_roots,
@@ -294,11 +272,9 @@ class DA3DemNdsmModel(nn.Module):
         print(f"[DA3DemNdsm] Model type: {type(self.net).__name__}")
 
         self.use_lora = bool(use_lora)
-        # choose LoRA target: backbone if available, else whole model
-        self.lora_target_mod = self.net.backbone if hasattr(self.net, "backbone") else self.net
-        if self.use_lora:
+        if self.use_lora and hasattr(self.net, "net"):
             n = apply_lora_to_linear(
-                self.lora_target_mod,
+                self.net.net,
                 target=lora_target,
                 r=lora_r,
                 alpha=lora_alpha,
@@ -310,21 +286,12 @@ class DA3DemNdsmModel(nn.Module):
         self.train_backbone = train_backbone
         if not train_backbone:
             print("[DA3DemNdsm] Freezing backbone (training heads only)")
-            # Freeze backbone
-            if hasattr(self.net, "backbone"):
-                if self.use_lora:
-                    mark_only_lora_trainable(self.net.backbone)
-                else:
-                    for p in self.net.backbone.parameters():
-                        p.requires_grad = False
-            elif hasattr(self.net, "net"):
+            if hasattr(self.net, "net"):
                 if self.use_lora:
                     mark_only_lora_trainable(self.net.net)
                 else:
                     for p in self.net.net.parameters():
                         p.requires_grad = False
-
-            # Keep heads trainable
             if hasattr(self.net, "head"):
                 for p in self.net.head.parameters():
                     p.requires_grad = True
@@ -547,30 +514,6 @@ def masked_grad_l1(pred, gt, mask):
     return num / denom
 
 
-def _downsample_for_loss(pred, gt, mask, factor: int):
-    """
-    Downsample pred/gt/mask for loss computation only.
-    Uses avg pooling for pred/gt, and conservative min-pool for mask.
-    """
-    if factor <= 1:
-        return pred, gt, mask
-
-    _, _, h, w = pred.shape
-    out_h = max(1, h // factor)
-    out_w = max(1, w // factor)
-    if out_h < 1 or out_w < 1:
-        return pred, gt, mask
-
-    pred_ds = F.adaptive_avg_pool2d(pred, (out_h, out_w))
-    gt_ds = F.adaptive_avg_pool2d(gt, (out_h, out_w))
-
-    # conservative mask: all-valid in block
-    inv = 1.0 - mask
-    inv_ds = F.adaptive_max_pool2d(inv, (out_h, out_w))
-    mask_ds = (1.0 - inv_ds).clamp(0, 1)
-    return pred_ds, gt_ds, mask_ds
-
-
 # ==================== Visualization ====================
 @torch.no_grad()
 def visualize_fixed_samples(model, dataset, indices, device, epoch, vis_dir):
@@ -674,8 +617,6 @@ def train_epoch(
     grad_w_dem, grad_w_ndsm,
     huber_w_dem, huber_w_ndsm,
     huber_delta_dem, huber_delta_ndsm,
-    lora_log_state=None,
-    loss_downsample=1,
 ):
     model.train()
 
@@ -707,10 +648,6 @@ def train_epoch(
         ndsm32 = ndsm.float()
         m32 = m.float()
 
-        if loss_downsample and loss_downsample > 1:
-            p_dem32, dem32, m32 = _downsample_for_loss(p_dem32, dem32, m32, loss_downsample)
-            p_ndsm32, ndsm32, _ = _downsample_for_loss(p_ndsm32, ndsm32, m32, loss_downsample)
-
         dem_h = masked_huber(p_dem32, dem32, m32, delta=huber_delta_dem)
         dem_g = masked_grad_l1(p_dem32, dem32, m32) if grad_w_dem > 0 else p_dem32.new_tensor(0.0)
         nd_h = masked_huber(p_ndsm32, ndsm32, m32, delta=huber_delta_ndsm)
@@ -730,14 +667,6 @@ def train_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
-
-        # LoRA sanity check (log once after first optimizer step)
-        if lora_log_state is not None and not lora_log_state.get("done", False):
-            if getattr(model, "use_lora", False) and hasattr(model, "net"):
-                lora_target_mod = model.net.backbone if hasattr(model.net, "backbone") else model.net
-                count, a_norm, b_norm = lora_stats(lora_target_mod)
-                print(f"[LoRA] After 1 step: modules={count} | A_norm={a_norm:.4f} B_norm={b_norm:.4f}")
-            lora_log_state["done"] = True
 
         totals["loss"] += loss.item()
         totals["dem_huber"] += dem_h.item()
@@ -764,7 +693,6 @@ def validate(
     grad_w_dem, grad_w_ndsm,
     huber_w_dem, huber_w_ndsm,
     huber_delta_dem, huber_delta_ndsm,
-    loss_downsample=1,
 ):
     model.eval()
 
@@ -790,10 +718,6 @@ def validate(
         dem32 = dem.float()
         ndsm32 = ndsm.float()
         m32 = m.float()
-
-        if loss_downsample and loss_downsample > 1:
-            p_dem32, dem32, m32 = _downsample_for_loss(p_dem32, dem32, m32, loss_downsample)
-            p_ndsm32, ndsm32, _ = _downsample_for_loss(p_ndsm32, ndsm32, m32, loss_downsample)
 
         dem_h = masked_huber(p_dem32, dem32, m32, delta=huber_delta_dem)
         dem_g = masked_grad_l1(p_dem32, dem32, m32) if grad_w_dem > 0 else p_dem32.new_tensor(0.0)
@@ -858,8 +782,6 @@ def main():
     ap.add_argument("--huber_w_ndsm", type=float, default=1.0, help="huber weight for nDSM")
     ap.add_argument("--huber_delta_dem", type=float, default=2.0)
     ap.add_argument("--huber_delta_ndsm", type=float, default=1.0)
-    ap.add_argument("--loss_downsample", type=int, default=1,
-                    help="downsample factor for loss (e.g., 30 for 30m labels)")
 
     # Viz
     ap.add_argument("--viz_samples", type=int, default=5)
@@ -893,7 +815,6 @@ def main():
     print(f"Loss: L = L_dem + {args.lambda_ndsm} * L_ndsm")
     print(f"DEM huber_w={args.huber_w_dem}, grad_w={args.grad_w_dem}")
     print(f"nDSM huber_w={args.huber_w_ndsm}, grad_w={args.grad_w_ndsm}")
-    print(f"Loss downsample factor: {args.loss_downsample}")
     print(f"LoRA: use={args.use_lora} r={args.lora_r} alpha={args.lora_alpha} "
           f"dropout={args.lora_dropout} target={args.lora_target}")
 
@@ -975,16 +896,6 @@ def main():
         init_ndsm_scale=init_ndsm_scale,
     ).to(device)
 
-    if args.use_lora and hasattr(model, "net"):
-        lora_target_mod = model.net.backbone if hasattr(model.net, "backbone") else model.net
-        count, a_norm, b_norm = lora_stats(lora_target_mod)
-        print(f"[LoRA] Init: modules={count} | A_norm={a_norm:.4f} B_norm={b_norm:.4f}")
-        if count == 0:
-            names = list_linear_module_names(lora_target_mod, max_items=80)
-            print("[LoRA] No modules matched target. Sample Linear names:")
-            for n in names:
-                print(f"  - {n}")
-
     # Optim
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.wd)
@@ -1050,7 +961,6 @@ def main():
             )
             print(f"  → Backbone unfrozen, LR={new_lr:.6f}")
 
-        lora_log_state = {"done": False}
         tr = train_epoch(
             model, train_loader, optimizer, scaler, device,
             amp_enabled=(args.amp and device == "cuda"),
@@ -1061,8 +971,6 @@ def main():
             huber_w_ndsm=args.huber_w_ndsm,
             huber_delta_dem=args.huber_delta_dem,
             huber_delta_ndsm=args.huber_delta_ndsm,
-            lora_log_state=lora_log_state,
-            loss_downsample=args.loss_downsample,
         )
 
         va = validate(
@@ -1075,7 +983,6 @@ def main():
             huber_w_ndsm=args.huber_w_ndsm,
             huber_delta_dem=args.huber_delta_dem,
             huber_delta_ndsm=args.huber_delta_ndsm,
-            loss_downsample=args.loss_downsample,
         )
 
         scheduler.step()
