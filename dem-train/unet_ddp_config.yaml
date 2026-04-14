@@ -1,0 +1,44 @@
+workerPoolSpecs:
+  - machineSpec:
+      machineType: g2-standard-24
+      acceleratorType: NVIDIA_L4
+      acceleratorCount: 2
+    replicaCount: 1
+    containerSpec:
+      imageUri: asia-northeast3-docker.pkg.dev/spaid-ai-project-001/training-repo/da3-dem-trainer:latest
+      env:
+      - name: WANDB_API_KEY
+        value: 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
+      - name: WANDB_PROJECT
+        value: da3-unet
+      args:
+                    - --ddp
+                    - --unfreeze_epoch=20
+                    - --train_roots=/gcs/dem_002/val
+                    - --out_dir=/gcs/dem_002/runs/unet_ddp
+                    - --model_name=depth-anything/DA3-LARGE
+                    - --batch_size=2
+                    - --epochs=80
+                    - --lr=1e-05
+                    - --wd=0.01
+                    - --amp
+                    - --seed=42
+                    - --num_workers=4
+                    - --target_size=518
+                    - --dem_clamp_min=-200
+                    - --dem_clamp_max=2000
+                    - --ndsm_clamp_max=300
+                    - --lambda_ndsm=0.05
+                    - --grad_w_dem=0.08
+                    - --grad_w_ndsm=0.5
+                    - --huber_w_dem=10.0
+                    - --huber_w_ndsm=1.0
+                    - --huber_delta_dem=10.0
+                    - --huber_delta_ndsm=1.0
+                    - --viz_samples=3
+                    - --init_from_stats
+                    - --stats_max_files=200
+                    - --stats_max_vals=2000000
+                    - --use_wandb
+                    - --wandb_project=da3-dem-unet_ddp
+                    - --wandb_run_name=v3_unet_ddp
